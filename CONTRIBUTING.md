@@ -148,6 +148,38 @@ docker stop web && docker rm web
 | `fix/*` | Bug fixes | PR to `dev` |
 | `chore/*` | Maintenance | PR to `dev` |
 
+CI runs only on pushes to `main`/`dev` and on PRs targeting `main`/`dev` — see
+[CI Branch Triggers](#ci-branch-triggers) for why a push to a feature branch may
+produce no run.
+
+## CI Branch Triggers
+
+CI only runs on specific branches. The workflow's `on` block (see
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) filters both event
+types:
+
+```yaml
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+```
+
+- **Push** runs CI automatically on direct pushes to `main` or `dev`.
+- **Pull request** runs CI when a PR's target (base) branch is `main` or `dev`.
+
+**Why a push may produce no run.** A push to any other branch — such as
+`feat/login`, `fix/typo`, or `chore/deps` — triggers nothing, because those
+branches are not in the `push.branches` list. CI starts for such a branch only
+once you open a PR targeting `main` or `dev`: the `pull_request` filter matches
+the PR's base branch, so `feat/login` → `dev` runs CI, while a standalone push
+to `feat/login` does not.
+
+This keeps CI focused on the branches that matter for integration and release
+(`main`, `dev`) and on PRs seeking to merge into them, rather than running on
+every feature-branch commit.
+
 ## Development Workflow
 
 1. **Create feature branch from dev:**
@@ -173,9 +205,17 @@ docker stop web && docker rm web
    To verify the built output locally, see
    [Previewing a Production Build](#previewing-a-production-build).
 
+   CI also enforces a production dependency audit that `npm run check` does not
+   include — see [Production Dependency Audit](#production-dependency-audit) to
+   run it locally before opening a PR.
+
 4. **Commit with conventional format (see below)**
 
 5. **Push and create PR to `dev`**
+
+   Pushing a new commit to an open PR (or to `main`/`dev`) cancels any CI run
+   still in progress for that same ref — see
+   [CI Concurrency and Cancelled Runs](#ci-concurrency-and-cancelled-runs).
 
 6. **After review + merge to `dev`:**
    - Staging deploy to Vercel preview
@@ -224,7 +264,116 @@ npm run build:prod
 
 This runs the production build with `NODE_ENV=production` and writes the
 generated assets to the `dist/` directory. Deploy or inspect `dist/` after the
-command completes.
+command completes. CI's `build` job also uploads its own `dist/` output as a
+downloadable artifact — see [CI dist Artifact](#ci-dist-artifact).
+
+## CI dist Artifact
+
+The `build` job (see [`.github/workflows/ci.yml`](./.github/workflows/ci.yml),
+step `Upload dist artifact`) uploads its build output as a named artifact:
+
+```yaml
+- name: Upload dist artifact
+  uses: actions/upload-artifact@v7
+  with:
+    name: dist
+    path: dist/
+    retention-days: 7
+```
+
+**Where it appears.** Once the run finishes, the `dist` artifact is listed in
+the **Artifacts** section of the workflow run's summary page — open the
+repository's Actions tab, click the CI run, and scroll to "Artifacts". It
+holds the contents of the `dist/` directory produced by `npm run build` in the
+`build` job. Download it as a zip to inspect that exact build without
+rebuilding locally.
+
+**Retention.** `retention-days: 7` keeps the artifact downloadable for seven
+days; GitHub then deletes it automatically. Once it is gone it can't be
+recovered — re-run the workflow or rebuild locally to produce a fresh `dist/`.
+
+## Production Dependency Audit
+
+CI's `test` job audits production dependencies right after installing them
+(see [`.github/workflows/ci.yml`](./.github/workflows/ci.yml), step
+`Audit dependencies`):
+
+```bash
+npm audit --omit=dev --audit-level=high
+```
+
+**What the flags do**
+
+- `--omit=dev` audits only production dependencies, skipping `devDependencies`.
+  Vulnerabilities in dev-only tooling (Vite, Vitest, ESLint, …) are excluded
+  entirely; only those reachable from a production dependency — including
+  transitive deps — are considered.
+- `--audit-level=high` sets the failure threshold. The command exits non-zero
+  only when a production dependency has a `high` or `critical` advisory; `low`
+  and `moderate` advisories are still reported but do not fail the build.
+
+In short, CI fails only when a production dependency has a `high` or `critical`
+vulnerability.
+
+**This check is not part of `npm run check`**, which covers lint, typecheck,
+tests, bundle budgets, and secret scanning — but not the audit. Run it
+separately before opening a PR:
+
+```bash
+npm install                               # keep package-lock.json in sync first
+npm audit --omit=dev --audit-level=high   # the exact command CI runs
+```
+
+Exit code `0` means the production tree is clean at the `high` threshold; any
+other code means at least one `high`/`critical` advisory was found.
+
+**If it fails**, address the reported advisory and re-run until the command
+exits `0`. Safe updates can be auto-applied with `npm audit fix`; for a
+major-version bump or a transitive dependency, update the package that
+introduces it. Always confirm the fix with the same `--omit=dev
+--audit-level=high` flags CI uses.
+
+## CI Concurrency and Cancelled Runs
+
+The workflow sets a top-level `concurrency` block (see
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) that cancels older
+runs when a newer one starts on the same branch or PR:
+
+```yaml
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+```
+
+**Group key.** Runs are grouped by `${{ github.workflow }}-${{ github.ref }}`:
+
+- `github.workflow` is the workflow name — `CI` (from `name: CI`).
+- `github.ref` is the ref that triggered the run: `refs/heads/main` or
+  `refs/heads/dev` for a branch push, or `refs/pull/<number>/merge` for a pull
+  request (for example, `refs/pull/4242/merge`).
+
+Each branch and each PR therefore gets its own group, such as
+`CI-refs/heads/main`, `CI-refs/heads/dev`, or `CI-refs/pull/4242/merge`.
+
+**`cancel-in-progress: true`** makes GitHub cancel the older in-progress run in
+that group whenever a new run starts.
+
+**What this means in practice**
+
+- Pushing a new commit to an open PR cancels that PR's still-running CI — the
+  two pushes share one `refs/pull/<number>/merge` group.
+- Pushing a new commit to `main` cancels the in-progress `main` run; the same
+  applies to `dev`. `main` and `dev` are separate groups, so a push to one does
+  not cancel a run on the other.
+- One PR's push does not cancel another PR's run — different PR numbers mean
+  different refs and different groups.
+- The group is keyed on the workflow name, so only the `CI` workflow is
+  affected; other workflows run independently.
+
+When a run is cancelled, GitHub marks it cancelled and stops any in-progress
+job in it (`test`, `build`, `docker`); jobs that have not started yet will not
+start. This keeps CI fast and avoids running checks against commits you have
+already superseded.
 
 ## Code Standards
 
